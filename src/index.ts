@@ -257,7 +257,7 @@ export function formatReport(report: SkillReport, config: Config): string {
 }
 
 export default function (pi: ExtensionAPI): void {
-  const configFile = join(pi.pi.Settings.instance.getAgentDir(), "jev-skills.json");
+  const configFile = () => join(pi.pi.Settings.instance.getAgentDir(), "jev-skills.json");
   let lastTask: { sessionId: string; prompt: string } | undefined;
   const judgeFor = (ctx: ExtensionContext) => resolveJudge({
     settings: pi.pi.Settings.instance, registry: ctx.modelRegistry,
@@ -276,7 +276,7 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, { task }, signal, _update, ctx) {
       if (!task.trim()) return { content: [{ type: "text", text: "Task required." }] };
       try {
-        const config = await readConfig(configFile);
+        const config = await readConfig(configFile());
         return { content: [{ type: "text", text: formatReport(await run(task, config, ctx, signal), config) }] };
       } catch (cause) {
         return { content: [{ type: "text", text: `Jev skills finder unavailable: ${cause instanceof Error ? cause.message : String(cause)}` }] };
@@ -289,7 +289,7 @@ export default function (pi: ExtensionAPI): void {
     async handler(args, ctx) {
       if (!args.trim()) return ctx.ui.notify("Usage: /jev-skills <task>", "warning");
       try {
-        const config = await readConfig(configFile);
+        const config = await readConfig(configFile());
         ctx.ui.notify(formatReport(await run(args, config, ctx), config), "info");
       } catch (cause) {
         ctx.ui.notify(`Jev skills finder unavailable: ${cause instanceof Error ? cause.message : String(cause)}`, "error");
@@ -303,9 +303,9 @@ export default function (pi: ExtensionAPI): void {
       try {
         const parts = args.trim().split(/\s+/);
         if (!args.trim() || parts[0] === "show" || parts[0] === "status") {
-          ctx.ui.notify(`${configFile}\n${JSON.stringify(await readConfig(configFile), null, 2)}`, "info");
+          ctx.ui.notify(`${configFile()}\n${JSON.stringify(await readConfig(configFile()), null, 2)}`, "info");
         } else if (parts[0] === "set" && parts.length === 3) {
-          ctx.ui.notify(JSON.stringify(await setConfig(configFile, parts[1], parts[2]), null, 2), "info");
+          ctx.ui.notify(JSON.stringify(await setConfig(configFile(), parts[1], parts[2]), null, 2), "info");
         } else {
           ctx.ui.notify("Usage: /jev-skills-config [status|set <debug|autoSuggest|checkCalls|threshold|timeoutMs> <value>]", "warning");
         }
@@ -318,7 +318,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     lastTask = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt };
     try {
-      const config = await readConfig(configFile);
+      const config = await readConfig(configFile());
       if (!config.autoSuggest || !event.prompt.trim()) return;
       const suggestion = skillSuggestion(await run(event.prompt, config, ctx));
       if (!suggestion) return;
@@ -330,7 +330,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("tool_call", async (event, ctx) => {
     try {
-      const config = await readConfig(configFile);
+      const config = await readConfig(configFile());
       if (!config.checkCalls || event.toolName !== "read") return;
       const readPath = event.input.path;
       if (typeof readPath !== "string") return;
