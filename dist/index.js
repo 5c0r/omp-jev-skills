@@ -56,9 +56,11 @@ export async function findSkills(task, skills, judge, threshold, timeoutMs, exte
             if (signal.aborted)
                 throw signal.reason;
             const response = await settleOnAbort(judge.judge({
-                state: JSON.stringify({ task, skills: batch.map((skill, index) => ({
+                state: JSON.stringify({
+                    task, skills: batch.map((skill, index) => ({
                         id: `skill_${index}`, name: skill.name, description: skill.description,
-                    })) }),
+                    }))
+                }),
                 questions,
             }, { signal }), signal);
             const answers = response.answers;
@@ -237,6 +239,16 @@ export function formatReport(report, config) {
 export default function (pi) {
     const configFile = () => join(pi.pi.Settings.instance.getAgentDir(), "jev-skills.json");
     let lastTask;
+    const promptIds = new Map();
+    const currentPrompts = new Map();
+    const sessionPrompts = new Map();
+    const isCurrentPrompt = (sessionId, generation, ctx) => currentPrompts.get(sessionId) === generation
+        && promptIds.get(sessionId) === generation.promptId
+        && !generation.controller.signal.aborted
+        && generation.started
+        && !generation.ended
+        && ctx.sessionManager.getSessionId() === sessionId
+        && !ctx.isIdle();
     const judgeFor = (ctx) => resolveJudge({
         settings: pi.pi.Settings.instance, registry: ctx.modelRegistry,
         sessionId: ctx.sessionManager.getSessionId(),
@@ -296,19 +308,78 @@ export default function (pi) {
         },
     });
     pi.on("before_agent_start", async (event, ctx) => {
-        lastTask = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt };
+        const sessionId = ctx.sessionManager.getSessionId();
+        const previous = currentPrompts.get(sessionId);
+        if (previous) {
+            previous.controller.abort();
+            if (!previous.started) {
+                previous.ended = true;
+                const prompts = sessionPrompts.get(sessionId)?.filter(prompt => prompt !== previous);
+                if (prompts?.length)
+                    sessionPrompts.set(sessionId, prompts);
+                else
+                    sessionPrompts.delete(sessionId);
+            }
+        }
+        const promptId = (promptIds.get(sessionId) ?? 0) + 1;
+        promptIds.set(sessionId, promptId);
+        const generation = {
+            promptId, prompt: event.prompt, controller: new AbortController(), started: false, ended: false,
+        };
+        currentPrompts.set(sessionId, generation);
+        const prompts = sessionPrompts.get(sessionId) ?? [];
+        prompts.push(generation);
+        sessionPrompts.set(sessionId, prompts);
+        lastTask = { sessionId, prompt: event.prompt };
         try {
-            const config = await readConfig(configFile());
-            if (!config.autoSuggest || !event.prompt.trim())
-                return;
-            const suggestion = skillSuggestion(await run(event.prompt, config, ctx));
-            if (!suggestion)
-                return;
-            return { message: { customType: "jev-skills-suggestion", display: true, content: suggestion } };
+            generation.config = await readConfig(configFile());
         }
         catch (cause) {
-            pi.logger.warn("Jev skills suggestion unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
+            pi.logger.warn("Jev skills prompt config unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
         }
+    });
+    // Agent-end lacks prompt IDs; pair started turns in order per session.
+    pi.on("agent_start", (_event, ctx) => {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const generation = currentPrompts.get(sessionId);
+        if (!generation || generation.started || generation.ended)
+            return;
+        generation.started = true;
+        const config = generation.config;
+        if (!config?.autoSuggest || !generation.prompt.trim() || !isCurrentPrompt(sessionId, generation, ctx))
+            return;
+        void (async () => {
+            try {
+                const report = await run(generation.prompt, config, ctx, generation.controller.signal);
+                if (!isCurrentPrompt(sessionId, generation, ctx))
+                    return;
+                const suggestion = skillSuggestion(report);
+                if (!suggestion || !isCurrentPrompt(sessionId, generation, ctx))
+                    return;
+                pi.sendMessage({ customType: "jev-skills-suggestion", display: true, content: suggestion }, { deliverAs: "aside" });
+            }
+            catch (cause) {
+                if (isCurrentPrompt(sessionId, generation, ctx)) {
+                    pi.logger.warn("Jev skills suggestion unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
+                }
+            }
+        })();
+    });
+    pi.on("agent_end", (_event, ctx) => {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const prompts = sessionPrompts.get(sessionId);
+        const generation = prompts?.find(prompt => prompt.started && !prompt.ended);
+        if (!generation || !prompts)
+            return;
+        generation.ended = true;
+        generation.controller.abort();
+        if (currentPrompts.get(sessionId) === generation)
+            currentPrompts.delete(sessionId);
+        const remaining = prompts.filter(prompt => prompt !== generation);
+        if (remaining.length)
+            sessionPrompts.set(sessionId, remaining);
+        else
+            sessionPrompts.delete(sessionId);
     });
     pi.on("tool_call", async (event, ctx) => {
         try {
