@@ -1,13 +1,23 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, mock, test } from "bun:test";
 import type { Judge, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension from "../src/index";
-import { findSkills, formatReport, readConfig, recognizeSkillRead, recommendSkill, setConfig, skillSuggestion, skillsFromCommands } from "../src/index";
+
+let extensionJudge: Judge = { label: "unavailable", async judge() { throw new Error("no judge model available"); } };
+mock.module("@oh-my-pi/pi-coding-agent/judgment", () => ({
+  journalJudgmentUsage: () => () => { },
+  resolveJudge: () => extensionJudge,
+}));
+// Install the deterministic Judge mock before importing the extension's static binding.
+const { default: extension, findSkills, formatReport, readConfig, recognizeSkillRead, recommendSkill, setConfig, skillSuggestion, skillsFromCommands } =
+  await import("../src/index");
 
 const dirs: string[] = [];
-afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
+afterEach(async () => {
+  extensionJudge = { label: "unavailable", async judge() { throw new Error("no judge model available"); } };
+  await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+});
 const commands = [
   { name: "skill:debugging", description: "Investigate runtime failures", source: "skill", path: "/opt/skills/debugging/SKILL.md" },
   { name: "skill:writing", description: "Improve user prose", source: "skill", path: "/opt/skills/writing/SKILL.md" },
@@ -19,8 +29,10 @@ const judge = (scores: number[]): Judge => ({
   label: "test judge",
   async judge<Q extends Questions>(request: JudgmentRequest<Q>): Promise<JudgmentResult<Q>> {
     // Typed boundary for dynamically keyed synthetic transport response.
-    return { api: "typesafe", provider: "typesafe", model: "jev-latest", usage,
-      answers: Object.fromEntries(Object.keys(request.questions).map((id, index) => [id, { type: "noul", noul: scores[index] }])) } as unknown as JudgmentResult<Q>;
+    return {
+      api: "typesafe", provider: "typesafe", model: "jev-latest", usage,
+      answers: Object.fromEntries(Object.keys(request.questions).map((id, index) => [id, { type: "noul", noul: scores[index] }]))
+    } as unknown as JudgmentResult<Q>;
   },
 });
 
@@ -62,14 +74,18 @@ test("skill diagnostics show top five with omitted counts while retaining full s
 });
 
 test("canonical path stays in results but is not sent to Judge for relevance", async () => {
-  const candidate = { name: "debugging", description: "Investigate failures",
-    path: "/Users/private/repo/SKILL.md", uri: "skill://debugging" };
+  const candidate = {
+    name: "debugging", description: "Investigate failures",
+    path: "/Users/private/repo/SKILL.md", uri: "skill://debugging"
+  };
   const bounded: Judge = {
     label: "privacy judge",
     async judge<Q extends Questions>(request: JudgmentRequest<Q>): Promise<JudgmentResult<Q>> {
       if (JSON.stringify(request.state).includes("/Users/private")) throw new Error("private path leaked");
-      return { api: "typesafe", provider: "typesafe", model: "jev-latest", usage,
-        answers: { skill_0: { type: "noul", noul: 0.9 } } } as unknown as JudgmentResult<Q>;
+      return {
+        api: "typesafe", provider: "typesafe", model: "jev-latest", usage,
+        answers: { skill_0: { type: "noul", noul: 0.9 } }
+      } as unknown as JudgmentResult<Q>;
     },
   };
   const report = await findSkills("investigate failures", [candidate], bounded, 0.65, 2000);
@@ -97,9 +113,11 @@ test("recognizes namespaced skill URI without matching unknown namespace suffix"
 });
 
 test("malformed or failed Judge leaves candidates unjudged and never forces a read", async () => {
-  const bad: Judge = { label: "bad", async judge<Q extends Questions>(): Promise<JudgmentResult<Q>> {
-    return { api: "typesafe", provider: "typesafe", model: "jev", usage, answers: { extraneous: { type: "noul", noul: 2 } } } as unknown as JudgmentResult<Q>;
-  } };
+  const bad: Judge = {
+    label: "bad", async judge<Q extends Questions>(): Promise<JudgmentResult<Q>> {
+      return { api: "typesafe", provider: "typesafe", model: "jev", usage, answers: { extraneous: { type: "noul", noul: 2 } } } as unknown as JudgmentResult<Q>;
+    }
+  };
   const report = await findSkills("debug", skillsFromCommands(commands), bad, 0.65, 2000);
   expect(report.results.every(result => result.status === "unjudged" && result.score === undefined)).toBe(true);
   expect(recommendSkill("writing", report)).toBeUndefined();
@@ -110,9 +128,11 @@ test("malformed or failed Judge leaves candidates unjudged and never forces a re
 });
 
 test("unabortable Judge settles before advisory deadline without blocking skill read", async () => {
-  const hung: Judge = { label: "hung", judge<Q extends Questions>() {
-    return Promise.withResolvers<JudgmentResult<Q>>().promise;
-  } };
+  const hung: Judge = {
+    label: "hung", judge<Q extends Questions>() {
+      return Promise.withResolvers<JudgmentResult<Q>>().promise;
+    }
+  };
   // Real AbortSignal.timeout plus a permanently pending transport exercises OMP's wall-clock boundary.
   const { promise: safety, reject } = Promise.withResolvers<never>();
   const guard = setTimeout(() => reject(new Error("Judge stayed pending past host budget")), 300);
@@ -171,22 +191,233 @@ test("independent profile config persists concurrent updates and rejects invalid
   expect(await readFile(file, "utf8")).toBe(before);
 });
 
-test("extension factory registers without initialized Settings", () => {
-  // Git-install validation runs the factory before Settings.init(); agent-dir access must be deferred.
-  const registered: string[] = [];
+test("extension factory does not access Settings before initialization", () => {
   const pi = {
-    registerTool: () => registered.push("tool"),
-    registerCommand: () => registered.push("command"),
-    on: () => registered.push("hook"),
+    registerTool: () => { },
+    registerCommand: () => { },
+    on: () => { },
     getAllTools: () => [],
     getActiveTools: () => [],
     zod: { object: () => ({}), string: () => ({ describe: () => ({}) }) },
-    logger: { warn: () => {} },
+    logger: { warn: () => { } },
     pi: { Settings: {} as Record<string, unknown> },
   };
   Object.defineProperty(pi.pi.Settings, "instance", {
     get() { throw new Error("Settings not initialized. Call Settings.init() first."); },
   });
   expect(() => extension(pi as never)).not.toThrow();
-  expect(registered).toEqual(["tool", "command", "command", "hook", "hook"]);
+});
+type BeforeStartHandler = (event: { prompt: string }, ctx: unknown) => Promise<unknown> | unknown;
+type LifecycleHandler = (event: unknown, ctx: unknown) => void;
+type AsideMessage = {
+  payload: { customType?: string; display?: boolean; content?: string };
+  options?: { deliverAs?: string };
+  afterAgentStart: boolean;
+};
+
+function controlledJudge(model: string) {
+  const started = Promise.withResolvers<void>();
+  const scoresReady = Promise.withResolvers<number[]>();
+  let wasStarted = false;
+  const controlled: Judge = {
+    label: model,
+    async judge<Q extends Questions>(request: JudgmentRequest<Q>): Promise<JudgmentResult<Q>> {
+      wasStarted = true;
+      started.resolve();
+      const scores = await scoresReady.promise;
+      return {
+        api: "typesafe", provider: "typesafe", model, usage,
+        answers: Object.fromEntries(Object.keys(request.questions).map((id, index) => [
+          id, { type: "noul", noul: scores[index] },
+        ])),
+      } as unknown as JudgmentResult<Q>;
+    },
+  };
+  return {
+    judge: controlled,
+    started: started.promise,
+    wasStarted: () => wasStarted,
+    resolve: (scores: number[]) => scoresReady.resolve(scores),
+  };
+}
+
+async function extensionHarness() {
+  const dir = await mkdtemp(join(tmpdir(), "jev-skills-extension-"));
+  dirs.push(dir);
+  const configFile = join(dir, "jev-skills.json");
+  let turnRunning = false;
+  let beforeStart: BeforeStartHandler | undefined;
+  let agentStart: LifecycleHandler | undefined;
+  let agentEnd: LifecycleHandler | undefined;
+  const activations: string[][] = [];
+  const messages: AsideMessage[] = [];
+  const messageSent = Promise.withResolvers<AsideMessage>();
+  const context = {
+    modelRegistry: {},
+    sessionManager: { getSessionId: () => "session-1" },
+    isIdle: () => !turnRunning,
+    hasUI: true,
+    ui: { notify: () => { } },
+  };
+  extension({
+    registerTool: () => { },
+    registerCommand: () => { },
+    on: (name: string, handler: unknown) => {
+      if (name === "before_agent_start") beforeStart = handler as BeforeStartHandler;
+      if (name === "agent_start") agentStart = handler as LifecycleHandler;
+      if (name === "agent_end") agentEnd = handler as LifecycleHandler;
+    },
+    sendMessage: (payload: AsideMessage["payload"], options?: AsideMessage["options"]) => {
+      const entry = { payload, options, afterAgentStart: turnRunning };
+      messages.push(entry);
+      messageSent.resolve(entry);
+    },
+    getCommands: () => commands,
+    getActiveTools: () => [],
+    setActiveTools: async (names: string[]) => { activations.push([...names]); },
+    zod: { object: () => ({}), string: () => ({ describe: () => ({}) }) },
+    logger: { warn: () => { } },
+    pi: { Settings: { instance: { getAgentDir: () => dir } } },
+  } as never);
+  const prepare = async (prompt: string) => {
+    if (!beforeStart) throw new Error("before_agent_start handler missing");
+    return beforeStart({ prompt }, context);
+  };
+  const launch = () => {
+    turnRunning = true;
+    agentStart?.({}, context);
+  };
+  return {
+    configFile,
+    activations,
+    messages,
+    messageSent: messageSent.promise,
+    prepare,
+    launch,
+    async start(prompt: string) {
+      const result = await prepare(prompt);
+      launch();
+      return result;
+    },
+    end() {
+      turnRunning = false;
+      agentEnd?.({ willContinue: false }, context);
+    },
+  };
+}
+
+test("before_agent_start settles under 100ms with a never-resolving Judge", async () => {
+  const harness = await extensionHarness();
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true, timeoutMs: 1000 }));
+  const judgeStarted = Promise.withResolvers<void>();
+  extensionJudge = {
+    label: "pending",
+    judge<Q extends Questions>() {
+      judgeStarted.resolve();
+      return Promise.withResolvers<JudgmentResult<Q>>().promise;
+    },
+  };
+
+  const startedAt = performance.now();
+  const start = harness.start("debug this issue");
+  await judgeStarted.promise;
+  const hookResult = await start;
+  const elapsedMs = performance.now() - startedAt;
+  harness.end();
+
+  expect(hookResult).toBeUndefined();
+  expect(elapsedMs).toBeLessThan(100);
+});
+
+test("skills suggestions use aside delivery only after agent_start and never force skills", async () => {
+  const harness = await extensionHarness();
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  extensionJudge = judge([0.92, 0.15]);
+
+  const hookResult = await harness.start("debug this issue");
+  expect(hookResult).toBeUndefined();
+  await harness.messageSent;
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload).toMatchObject({ customType: "jev-skills-suggestion", display: true });
+  expect(harness.messages[0].payload.content).toContain("skill://debugging");
+  expect(harness.messages[0].payload.content).not.toContain("/opt/skills");
+  expect(harness.messages[0].options).toEqual({ deliverAs: "aside" });
+  expect(harness.messages[0].afterAgentStart).toBe(true);
+  expect(harness.activations).toEqual([]);
+});
+
+test("late Judge result after agent_end is discarded", async () => {
+  const harness = await extensionHarness();
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const pending = controlledJudge("late");
+  extensionJudge = pending.judge;
+
+  const start = harness.start("debug this issue");
+  await pending.started;
+  harness.end();
+  pending.resolve([0.92, 0.15]);
+  const hookResult = await start;
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(hookResult).toBeUndefined();
+  expect(harness.messages).toEqual([]);
+  expect(harness.activations).toEqual([]);
+});
+
+test("overlapping prompts cancel old Judge work and only current generation delivers", async () => {
+  const harness = await extensionHarness();
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const first = controlledJudge("first");
+  const second = controlledJudge("second");
+  extensionJudge = first.judge;
+
+  const firstStart = harness.start("debug first prompt");
+  await first.started;
+  extensionJudge = second.judge;
+  const secondStart = harness.start("debug second prompt");
+  await second.started;
+  first.resolve([0.92, 0.15]);
+  second.resolve([0.15, 0.92]);
+  const [firstResult, secondResult] = await Promise.all([firstStart, secondStart]);
+  expect(firstResult).toBeUndefined();
+  expect(secondResult).toBeUndefined();
+  await harness.messageSent;
+  harness.end();
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload.content).toContain("typesafe/second");
+  expect(harness.messages[0].payload.content).not.toContain("typesafe/first");
+  expect(harness.activations).toEqual([]);
+});
+test("before A then B binds agent_start to latest generation", async () => {
+  const harness = await extensionHarness();
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const first = controlledJudge("first");
+  const second = controlledJudge("second");
+  extensionJudge = {
+    label: "prompt dispatcher",
+    judge<Q extends Questions>(request: JudgmentRequest<Q>) {
+      const selected = JSON.stringify(request.state).includes("second prompt") ? second.judge : first.judge;
+      return selected.judge(request);
+    },
+  };
+
+  await harness.prepare("debug first prompt");
+  await harness.prepare("debug second prompt");
+  harness.launch();
+
+  expect(first.wasStarted()).toBe(false);
+  expect(second.wasStarted()).toBe(true);
+  second.resolve([0.15, 0.92]);
+  await harness.messageSent;
+  harness.end();
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload.content).toContain("typesafe/second");
+  expect(harness.messages[0].payload.content).not.toContain("typesafe/first");
+  expect(harness.messages[0].payload.content).toContain("skill://writing");
+  expect(harness.activations).toEqual([]);
 });

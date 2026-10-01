@@ -44,7 +44,12 @@ elapsed time, token usage/cost, and any Judge error. Judge calls
 can incur provider charges.
 
 Skill commands must be enabled in OMP for this metadata-backed inventory.
-`autoSuggest` adds up to three optional suggestions before a prompt.
+`autoSuggest` is opt-in and default-off. Its Judge task starts after
+`agent_start`, then sends up to three accepted suggestions as a non-interrupting
+aside; `before_agent_start` never waits for network work. Each prompt has a
+session-scoped generation: a newer prompt or `agent_end` cancels it, and stale
+results are dropped.
+
 `checkCalls` advises only on recognized `read` calls targeting a discovered
 `skill://` URI or that skill's actual `SKILL.md` path. Judge state contains the
 supplied finder task or, for hooks, the latest session prompt, plus discovered
@@ -52,9 +57,15 @@ skill names/descriptions. The extension does not append local skill paths,
 file contents, or read arguments (including `i`); prompts themselves may
 contain sensitive text. It cannot see every skill invocation or force a load.
 Normal OMP reading and approvals stay unchanged. If Judge lacks auth, fails,
-returns malformed answers, or times out, explicit search reports it; automatic
-hooks do nothing (including after a partially scored batch). No extra model
-fallback.
+returns malformed answers, or times out, automatic hooks do nothing, including
+after a partially scored batch or after the originating turn ends. No extra
+model fallback.
+
+OMP's public `sendMessage` is fire-and-forget; the host normalizes images before
+rechecking whether the agent is streaming. If a turn ends after the extension's
+final check but before that host check, an idle aside can start a turn. The
+extension checks immediately before dispatch, but this narrow host-side race is
+not atomic or structurally eliminated.
 
 ## Develop
 
